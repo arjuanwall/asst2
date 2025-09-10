@@ -9,11 +9,11 @@ all: $(EXECUTABLE)
 ###########################################################
 
 OBJDIR=objs
-CXX=g++ -m64
+CXX=g++-11 -m64
 CXXFLAGS=-O3 -Wall
 LDFLAGS=-L/usr/local/cuda-11.7/lib64/ -lcudart
 NVCC=nvcc
-NVCCFLAGS=-O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/gcc
+NVCCFLAGS=-O3 -m64 --gpu-architecture compute_61 -ccbin /usr/bin/g++-11
 
 
 OBJS=$(OBJDIR)/main.o  $(OBJDIR)/scan.o
