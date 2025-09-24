@@ -29,6 +29,26 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void upsweep_kernel(int* data, int n, int stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int index = (i + 1) * stride * 2 - 1;
+    
+    if (index < n && index >= stride) {
+        data[index] += data[index - stride];
+    }
+}
+
+__global__ void downsweep_kernel(int* data, int n, int stride) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int index = (i + 1) * stride * 2 - 1;
+    
+    if (index < n && index >= stride) {
+        int temp = data[index - stride];
+        data[index - stride] = data[index];
+        data[index] += temp;
+    }
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +63,34 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+
+    int n = nextPow2(length);
+    
+    for (int stride = 1; stride < n; stride *= 2) {
+        int num_threads = n / (stride * 2);
+        if (num_threads > 0) {
+            int blocks = (num_threads + 255) / 256;
+            if (blocks > 0) {
+                upsweep_kernel<<<blocks, 256>>>(device_data, n, stride);
+            }
+        }
+    }
+    cudaDeviceSynchronize();
+    
+    if (n > 0) {
+        cudaMemset(&device_data[n-1], 0, sizeof(int));
+    }
+    
+    for (int stride = n/2; stride > 0; stride /= 2) {
+        int num_threads = n / (stride * 2);
+        if (num_threads > 0) {
+            int blocks = (num_threads + 255) / 256;
+            if (blocks > 0) {
+                downsweep_kernel<<<blocks, 256>>>(device_data, n, stride);
+            }
+        }
+    }
+    cudaDeviceSynchronize();
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -109,6 +157,29 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void mark_peaks_kernel(int* input, int* flags, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (i < length) {
+        if (i > 0 && i < length - 1) {
+            if (input[i] > input[i - 1] && input[i] > input[i + 1]) {
+                flags[i] = 1;
+            } else {
+                flags[i] = 0;
+            }
+        } else {
+            flags[i] = 0;
+        }
+    }
+}
+
+__global__ void gather_indices_kernel(int* flags, int* scanned_flags, int* output, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (i < length && flags[i] == 1) {
+        output[scanned_flags[i]] = i;
+    }
+}
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -125,9 +196,50 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
-}
 
+    if (length <= 2) {
+        return 0;
+    }
+    
+    int rounded_length = nextPow2(length);
+    int *device_flags;
+    int *device_scanned_flags;
+    
+    cudaMalloc((void**)&device_flags, rounded_length * sizeof(int));
+    cudaMalloc((void**)&device_scanned_flags, rounded_length * sizeof(int));
+    
+    cudaMemset(device_flags, 0, rounded_length * sizeof(int));
+    cudaMemset(device_scanned_flags, 0, rounded_length * sizeof(int));
+    
+    int blocks = (length + 255) / 256;
+    if (blocks > 0) {
+        mark_peaks_kernel<<<blocks, 256>>>(device_input, device_flags, length);
+        cudaDeviceSynchronize();
+    }
+    
+    cudaMemcpy(device_scanned_flags, device_flags, length * sizeof(int), 
+               cudaMemcpyDeviceToDevice);
+    
+    exclusive_scan(device_scanned_flags, length);
+    
+    int total_peaks = 0;
+    if (length > 0) {
+        int last_flag, last_scanned;
+        cudaMemcpy(&last_flag, &device_flags[length-1], sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&last_scanned, &device_scanned_flags[length-1], sizeof(int), cudaMemcpyDeviceToHost);
+        total_peaks = last_scanned + last_flag;
+    }
+    
+    if (total_peaks > 0 && blocks > 0) {
+        gather_indices_kernel<<<blocks, 256>>>(device_flags, device_scanned_flags, device_output, length);
+        cudaDeviceSynchronize();
+    }
+    
+    cudaFree(device_flags);
+    cudaFree(device_scanned_flags);
+    
+    return total_peaks;
+}
 
 
 /* Timing wrapper around find_peaks. You should not modify this function.
